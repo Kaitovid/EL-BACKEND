@@ -25,12 +25,14 @@ async function buildLeaderboard(conn, whereClause = '', params = []) {
     params
   );
 
-  return rows.map((row, i) => ({
+return rows.map((row, i) => ({
     pos: i + 1,
     id: row.id,
     nombre: row.nombre,
     carrera: row.carrera,
     edad: row.edad,
+    genero: row.genero || 'desconocido',
+    semestre: row.semestre,
     total: row.total,
     razon: row.razon || null,
     medal: row.medal || '',
