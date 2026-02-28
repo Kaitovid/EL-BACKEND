@@ -3,36 +3,34 @@ const { getPool } = require('../lib/db');
 
 const router = express.Router();
 
-// ─── Helper: obtener posición real calculada por total_votos DESC ────────────
-async function buildLeaderboard(conn, whereClause = '', params = []) {
+// ─── Helper: leaderboard (solo razones aprobadas) ───────────────────────────
+async function buildLeaderboard(conn) {
   const [rows] = await conn.execute(
     `SELECT
        p.id,
        p.nombre,
        p.carrera,
-       p.edad,
        p.genero,
-       p.semestre,
        r.total_votos AS total,
        r.medalla     AS medal,
-       GROUP_CONCAT(ra.descripcion SEPARATOR ', ') AS razon
+       GROUP_CONCAT(
+         CASE WHEN ra.status = 'aprobado' THEN ra.descripcion END
+         ORDER BY ra.id ASC
+         SEPARATOR ', '
+       ) AS razon
      FROM ranking r
      JOIN personas p  ON r.persona_id = p.id
      LEFT JOIN razones ra ON ra.persona_id = p.id
-     ${whereClause}
-     GROUP BY p.id, p.nombre, p.carrera, p.edad, p.genero, p.semestre, r.total_votos, r.medalla
-     ORDER BY r.total_votos DESC, p.nombre ASC`,
-    params
+     GROUP BY p.id, p.nombre, p.carrera, p.genero, r.total_votos, r.medalla
+     ORDER BY r.total_votos DESC, p.nombre ASC`
   );
 
-return rows.map((row, i) => ({
+  return rows.map((row, i) => ({
     pos: i + 1,
     id: row.id,
     nombre: row.nombre,
     carrera: row.carrera,
-    edad: row.edad,
     genero: row.genero || 'desconocido',
-    semestre: row.semestre,
     total: row.total,
     razon: row.razon || null,
     medal: row.medal || '',
@@ -45,6 +43,59 @@ router.get('/', async (_req, res) => {
     const conn = getPool();
     const leaderboard = await buildLeaderboard(conn);
     res.json({ success: true, data: leaderboard });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, data: null, error: err.message });
+  }
+});
+
+// ─── GET /api/personas/moderacion/pendientes  →  panel de moderación ────────
+router.get('/moderacion/pendientes', async (_req, res) => {
+  try {
+    const conn = getPool();
+    const [rows] = await conn.execute(
+      `SELECT
+         rz.id AS razon_id,
+         rz.descripcion,
+         rz.status,
+         rz.created_at,
+         p.id AS persona_id,
+         p.nombre AS persona_nombre,
+         p.carrera AS persona_carrera,
+         p.genero AS persona_genero,
+         r.total_votos,
+         r.posicion
+       FROM razones rz
+       JOIN personas p ON rz.persona_id = p.id
+       LEFT JOIN ranking r ON r.persona_id = p.id
+       ORDER BY FIELD(rz.status, 'pendiente', 'rechazado', 'aprobado'), rz.created_at DESC`
+    );
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, data: null, error: err.message });
+  }
+});
+
+// ─── PUT /api/personas/moderacion/:razonId  →  aprobar / rechazar ───────────
+router.put('/moderacion/:razonId', async (req, res) => {
+  try {
+    const razonId = parseInt(req.params.razonId, 10);
+    const { status } = req.body;
+    const conn = getPool();
+
+    if (!['pendiente', 'aprobado', 'rechazado'].includes(status)) {
+      return res.status(400).json({ success: false, data: null, error: 'status debe ser "pendiente", "aprobado" o "rechazado"' });
+    }
+
+    const [check] = await conn.execute('SELECT id FROM razones WHERE id = ?', [razonId]);
+    if (check.length === 0) {
+      return res.status(404).json({ success: false, data: null, error: 'Razón no encontrada' });
+    }
+
+    await conn.execute('UPDATE razones SET status = ? WHERE id = ?', [status, razonId]);
+
+    res.json({ success: true, data: { razon_id: razonId, status } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, data: null, error: err.message });
@@ -70,9 +121,9 @@ router.get('/:id', async (req, res) => {
 // ─── POST /api/personas  →  registrar (crea o incrementa) ───────────────────
 router.post('/', async (req, res) => {
   try {
-    const { nombre, edad, carrera, razon } = req.body;
-    if (!nombre || !edad || !carrera) {
-      return res.status(400).json({ success: false, data: null, error: 'nombre, edad y carrera son requeridos' });
+    const { nombre, carrera, genero, razon } = req.body;
+    if (!nombre || !carrera) {
+      return res.status(400).json({ success: false, data: null, error: 'nombre y carrera son requeridos' });
     }
 
     const conn = getPool();
@@ -92,7 +143,7 @@ router.post('/', async (req, res) => {
         'UPDATE ranking SET total_votos = total_votos + 1 WHERE persona_id = ?',
         [personaId]
       );
-      // Agregar razón si se proporcionó
+      // Agregar razón si se proporcionó (status: pendiente por defecto)
       if (razon) {
         await conn.execute(
           'INSERT INTO razones (persona_id, descripcion) VALUES (?, ?)',
@@ -101,9 +152,10 @@ router.post('/', async (req, res) => {
       }
     } else {
       // Crear nueva persona
+      const gen = genero || 'desconocido';
       const [insertP] = await conn.execute(
-        'INSERT INTO personas (nombre, carrera, edad) VALUES (?, ?, ?)',
-        [nombre, carrera, edad]
+        'INSERT INTO personas (nombre, carrera, genero) VALUES (?, ?, ?)',
+        [nombre, carrera, gen]
       );
       personaId = insertP.insertId;
 
@@ -124,10 +176,8 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // Actualizar medallas
     await updateMedals(conn);
 
-    // Devolver la persona actualizada
     const leaderboard = await buildLeaderboard(conn);
     const persona = leaderboard.find(r => r.id === personaId);
     res.json({ success: true, data: persona });
@@ -141,21 +191,19 @@ router.post('/', async (req, res) => {
 router.put('/:id', async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
-    const { nombre, edad, carrera, total, razon } = req.body;
+    const { nombre, carrera, genero, total, razon } = req.body;
     const conn = getPool();
 
-    // Verificar existencia
     const [check] = await conn.execute('SELECT id FROM personas WHERE id = ?', [id]);
     if (check.length === 0) {
       return res.status(404).json({ success: false, data: null, error: 'Persona no encontrada' });
     }
 
-    // Actualizar persona
     const updates = [];
     const values = [];
-    if (nombre !== undefined) { updates.push('nombre = ?'); values.push(nombre); }
-    if (edad !== undefined)   { updates.push('edad = ?');   values.push(edad); }
-    if (carrera !== undefined) { updates.push('carrera = ?'); values.push(carrera); }
+    if (nombre !== undefined)  { updates.push('nombre = ?');  values.push(nombre); }
+    if (carrera !== undefined)  { updates.push('carrera = ?');  values.push(carrera); }
+    if (genero !== undefined)  { updates.push('genero = ?');  values.push(genero); }
 
     if (updates.length > 0) {
       values.push(id);
@@ -236,14 +284,12 @@ router.delete('/:id', async (req, res) => {
       return res.status(403).json({ success: false, data: null, error: 'Contraseña incorrecta' });
     }
 
-    // Obtener datos antes de eliminar
     const leaderboard = await buildLeaderboard(conn);
     const persona = leaderboard.find(r => r.id === id);
     if (!persona) {
       return res.status(404).json({ success: false, data: null, error: 'Persona no encontrada' });
     }
 
-    // Eliminar en orden: razones → ranking → personas
     await conn.execute('DELETE FROM razones WHERE persona_id = ?', [id]);
     await conn.execute('DELETE FROM ranking WHERE persona_id = ?', [id]);
     await conn.execute('DELETE FROM personas WHERE id = ?', [id]);
